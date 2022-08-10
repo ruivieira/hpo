@@ -271,12 +271,13 @@ function check_running() {
 
 # Resolve Container runtime
 function resolve_container_runtime() {
-	IFS='=' read -r -a dockerDeamonState <<< $(systemctl show --property ActiveState docker)
-	[[ "${dockerDeamonState[1]}" == "inactive" ]] && CONTAINER_RUNTIME="podman"
-	if ! command -v podman &> /dev/null; then
-		echo "No Container Runtime available: Docker daemon is not running and podman command could not be found"
-		exit 1
-	fi
+	echo "Using docker"
+	# IFS='=' read -r -a dockerDeamonState <<< $(systemctl show --property ActiveState docker)
+	# [[ "${dockerDeamonState[1]}" == "inactive" ]] && CONTAINER_RUNTIME="podman"
+	# if ! command -v podman &> /dev/null; then
+	# 	echo "No Container Runtime available: Docker daemon is not running and podman command could not be found"
+	# 	exit 1
+	# fi
 }
 
 # Check error code from last command, exit on error

@@ -54,6 +54,7 @@ class HpoService:
             self.expStateCond.release()
 
     def startExperiment(self, name):
+        print(f"Starting experiment: {name}")
         try:
             self.expStateCond.acquire()
             experiment: optuna_hpo.HpoExperiment = self.experiments.get(name)
@@ -126,6 +127,7 @@ class HpoService:
             try:
                 experiment.resultsAvailableCond.acquire()
                 trialConfig = json.dumps(experiment.trialDetails.trial_json_object)
+                print(experiment.model)
             finally:
                 experiment.resultsAvailableCond.release()
             return trialConfig

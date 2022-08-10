@@ -16,10 +16,16 @@ limitations under the License.
 
 import optuna
 import threading
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF
+import numpy as np
+import pandas as pd
+from collections import defaultdict
 
 from logger import get_logger
 
 logger = get_logger(__name__)
+
 
 trials = []
 
@@ -42,6 +48,7 @@ class HpoExperiment:
     """
     HpoExperiment contains the details of a Running experiment.
     """
+
     thread: threading.Thread
     experiment_name: str
     total_trials: int
@@ -60,8 +67,18 @@ class HpoExperiment:
     # recommended_config (json): A JSON containing the recommended config.
     recommended_config = {}
 
-    def __init__(self, experiment_name, total_trials, parallel_trials, direction, hpo_algo_impl, id_,
-                 objective_function, tunables, value_type):
+    def __init__(
+        self,
+        experiment_name,
+        total_trials,
+        parallel_trials,
+        direction,
+        hpo_algo_impl,
+        id_,
+        objective_function,
+        tunables,
+        value_type,
+    ):
         self.experiment_name = experiment_name
         self.total_trials = total_trials
         self.parallel_trials = parallel_trials
@@ -72,7 +89,9 @@ class HpoExperiment:
         self.tunables = tunables
         self.value_type = value_type
         self.trialDetails = TrialDetails()
+        self.data = []
         self.thread = threading.Thread(target=self.recommend)
+        self.model = None
 
     def start(self) -> threading.Condition:
         try:
@@ -110,9 +129,47 @@ class HpoExperiment:
                 raise Exception("Stopping experiment: {}".format(self.experiment_name))
             result_value = self.trialDetails.result_value
             trial_result = self.trialDetails.trial_result
+            self.data.append({"value": result_value})
         finally:
             self.resultsAvailableCond.release()
         return result_value, trial_result
+
+    def _create_surrogate_model(self, trials) -> GaussianProcessRegressor:
+        """Create a GPR surrogate model to use with TrustyAI explainers"""
+        kernel = 1.0 * RBF(3.0)
+        X = []
+        y = []
+        for i, _ in enumerate(trials):
+            trial = trials[i]
+            tunables = trial["experiment_tunables"]
+            X.append([tunable["tunable_value"] for tunable in tunables])
+            status = trial["experiment_status"]
+            if status == "success":
+                y.append(self.data[i]["value"])
+
+        X = np.array(X)
+        y = np.array(y).ravel()
+        model = GaussianProcessRegressor(kernel=kernel)
+        model.fit(X, y)
+        return model
+
+    def _generate_background_data(self, trials, n=3):
+        from org.kie.kogito.explainability.model import PredictionInput
+        from trustyai.model import feature
+        N = len(trials)
+        means = defaultdict(int)
+        for i in range(len(trials)):
+            trial = trials[i]
+            tunables = trial["experiment_tunables"]
+            for t in tunables:
+                means[t["tunable_name"]] += t["tunable_value"]
+
+        bg = []
+        for tunable in trials[0]["experiment_tunables"]:
+            name = tunable["tunable_name"]
+            bg.append(feature(name=name, dtype="number", value=means[name]/N))
+        print(bg)
+        return [PredictionInput(bg)]
 
     def recommend(self):
         """
@@ -144,11 +201,16 @@ class HpoExperiment:
 
         # Create a study object
         try:
-            study = optuna.create_study(direction=self.direction, sampler=sampler, study_name=self.experiment_name)
-
+            study = optuna.create_study(
+                direction=self.direction,
+                sampler=sampler,
+                study_name=self.experiment_name,
+            )
 
             # Execute an optimization by using an 'Objective' instance
-            study.optimize(Objective(self), n_trials=self.total_trials, n_jobs=self.parallel_trials)
+            study.optimize(
+                Objective(self), n_trials=self.total_trials, n_jobs=self.parallel_trials
+            )
 
             self.trialDetails.trial_number = -1
 
@@ -161,13 +223,41 @@ class HpoExperiment:
 
             logger.debug("All trials: " + str(trials))
 
+            # train the surrogate model
+            self.model = self._create_surrogate_model(trials=trials)
+
+            # Initialise TrustyAI
+            import trustyai
+
+            trustyai.init()
+
+            # LIME explainer
+            from trustyai.model import Model
+            from trustyai.model import simple_prediction
+            from trustyai.model import feature
+            from trustyai.model import output
+            from org.kie.kogito.explainability.model import PredictionOutput
+
+            def _predict(inputs):
+                values = [_feature.value.as_obj() for _feature in inputs[0].features]
+                result = self.model.predict(np.array([values]))
+                _output = output(
+                    name="PaidLoan", dtype="bool", value=result[0], score=0.0
+                )
+                return [PredictionOutput([_output])]
+
+            _model = Model(_predict)
+
             try:
                 self.resultsAvailableCond.acquire()
-                optimal_value = {"objective_function": {
-                    "name": self.objective_function,
-                    "value": study.best_value,
-                    "value_type": self.value_type
-                }, "tunables": []}
+                optimal_value = {
+                    "objective_function": {
+                        "name": self.objective_function,
+                        "value": study.best_value,
+                        "value_type": self.value_type,
+                    },
+                    "tunables": [],
+                }
 
                 for tunable in self.tunables:
                     for key, value in study.best_params.items():
@@ -177,7 +267,7 @@ class HpoExperiment:
                         {
                             "name": tunable["name"],
                             "value": tunable_value,
-                            "value_type": tunable["value_type"]
+                            "value_type": tunable["value_type"],
                         }
                     )
 
@@ -185,11 +275,62 @@ class HpoExperiment:
                 self.recommended_config["experiment_name"] = self.experiment_name
                 self.recommended_config["direction"] = self.direction
                 self.recommended_config["optimal_value"] = optimal_value
+
+                logger.info("Optimal value:")
+                logger.info(optimal_value)
             finally:
                 self.resultsAvailableCond.release()
 
+            tunables = self.recommended_config["optimal_value"]["tunables"]
+            input_features = []
+            for tunable in tunables:
+                input_features.append(
+                    feature(
+                        name=tunable["name"], dtype="number", value=tunable["value"]
+                    )
+                )
+            for f in input_features:
+                print(f)
+            objective = self.recommended_config["optimal_value"]["objective_function"]
+            output_features = [
+                output(
+                    name=objective["name"],
+                    dtype="number",
+                    value=objective["value"],
+                    score=0.0,
+                )
+            ]
+            for o in output_features:
+                print(o.toString())
+            prediction = simple_prediction(
+                input_features=input_features, outputs=output_features
+            )
+
+            # LIME explanation
+            from trustyai.explainers import LimeExplainer
+
+            explainer = LimeExplainer(samples=100)
+            explanation = explainer.explain(prediction, _model)
+            print("LIME Explanation:")
+            pd.set_option("display.max_rows", None, "display.max_columns", None)
+            print(explanation.as_dataframe())
+
+            # SHAP explanation
+            from trustyai.explainers import SHAPExplainer
+
+            bg = self._generate_background_data(trials)
+            for i in bg:
+                print(i)
+            explainer = SHAPExplainer(background=bg)
+            explanation = explainer.explain(prediction, _model)
+            print("SHAP Explanation:")
+            print(explanation.as_dataframe())
+            for saliency in explanation.getSaliencies():
+                print(saliency)
+
             logger.info("Recommended config: " + str(self.recommended_config))
-        except:
+        except Exception as e:
+            logger.info(e)
             logger.warn("Experiment stopped: " + str(self.experiment_name))
 
     def stop(self):
@@ -235,16 +376,26 @@ class Objective(TrialDetails):
             for tunable in self.tunables:
                 if tunable["value_type"].lower() == "double":
                     tunable_value = trial.suggest_discrete_uniform(
-                        tunable["name"], tunable["lower_bound"], tunable["upper_bound"], tunable["step"]
+                        tunable["name"],
+                        tunable["lower_bound"],
+                        tunable["upper_bound"],
+                        tunable["step"],
                     )
                 elif tunable["value_type"].lower() == "integer":
                     tunable_value = trial.suggest_int(
-                        tunable["name"], tunable["lower_bound"], tunable["upper_bound"], tunable["step"]
+                        tunable["name"],
+                        tunable["lower_bound"],
+                        tunable["upper_bound"],
+                        tunable["step"],
                     )
                 elif tunable["value_type"].lower() == "categorical":
-                    tunable_value = trial.suggest_categorical(tunable["name"], tunable["choices"])
+                    tunable_value = trial.suggest_categorical(
+                        tunable["name"], tunable["choices"]
+                    )
 
-                experiment_tunables.append({"tunable_name": tunable["name"], "tunable_value": tunable_value})
+                experiment_tunables.append(
+                    {"tunable_name": tunable["name"], "tunable_value": tunable_value}
+                )
 
             config["experiment_tunables"] = experiment_tunables
 
